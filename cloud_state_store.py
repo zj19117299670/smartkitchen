@@ -1,91 +1,90 @@
-"""Cloud MySQL persistence for the Smart Kitchen UI state.
+"""CloudBase MySQL persistence for the Smart Kitchen UI state.
 
-The application remains usable locally without database environment variables.
-When DB_HOST/DB_USER/DB_PASSWORD/DB_NAME are configured, every state revision is
-stored in MySQL so stateless CloudBase instances and Android clients share state.
+The CloudBase API key stays in the Cloud Run environment. Android and web
+clients access only this application's authenticated state endpoint.
 """
 
 import json
 import os
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 
 class CloudStateStore:
+    """Persist the singleton kitchen state using CloudBase's MySQL HTTP API."""
+
+    TABLE = "smart_kitchen_state"
+    RECORD_ID = "global"
+
     def __init__(self, logger):
         self.logger = logger
-        self.host = os.environ.get("DB_HOST", "").strip()
-        self.user = os.environ.get("DB_USER", "").strip()
-        self.password = os.environ.get("DB_PASSWORD", "")
-        self.database = os.environ.get("DB_NAME", "").strip()
-        self.port = int(os.environ.get("DB_PORT", "3306"))
-        self.enabled = bool(self.host and self.user and self.password and self.database)
-        self._driver = None
-        if self.enabled:
-            try:
-                import pymysql
-                self._driver = pymysql
-                self._ensure_table()
-                self.logger.info("Cloud state storage is enabled.")
-            except Exception as exc:  # Service must still start when DB is temporarily unavailable.
-                self.enabled = False
-                self.logger.error("Cloud state storage disabled: %s", exc)
-
-    def _connect(self):
-        return self._driver.connect(
-            host=self.host,
-            port=self.port,
-            user=self.user,
-            password=self.password,
-            database=self.database,
-            charset="utf8mb4",
-            connect_timeout=5,
-            read_timeout=5,
-            write_timeout=5,
-            autocommit=True,
+        self.env_id = os.environ.get("CLOUDBASE_ENV_ID", "").strip()
+        self.api_key = os.environ.get("CLOUDBASE_API_KEY", "").strip()
+        self.enabled = bool(self.env_id and self.api_key)
+        self._record_exists = False
+        self.base_url = (
+            f"https://{self.env_id}.api.tcloudbasegateway.com/v1/rdb/rest/{self.TABLE}"
+            if self.enabled else ""
         )
+        if self.enabled:
+            self.logger.info("CloudBase state storage is enabled.")
+        else:
+            self.logger.info("CloudBase state storage is not configured; using local state only.")
 
-    def _ensure_table(self):
-        with self._connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS smart_kitchen_state (
-                        state_id TINYINT UNSIGNED NOT NULL PRIMARY KEY,
-                        state_json LONGTEXT NOT NULL,
-                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                            ON UPDATE CURRENT_TIMESTAMP
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                    """
-                )
+    def _request(self, method, url, payload=None):
+        body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        with urllib.request.urlopen(request, timeout=5) as response:
+            raw = response.read().decode("utf-8")
+            return response.status, json.loads(raw) if raw else None
 
     def save(self, state):
         if not self.enabled:
             return
+        payload = {
+            "id": self.RECORD_ID,
+            "state_json": json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+            "updated_at": int(time.time()),
+        }
         try:
-            payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
-            with self._connect() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        INSERT INTO smart_kitchen_state (state_id, state_json)
-                        VALUES (1, %s)
-                        ON DUPLICATE KEY UPDATE state_json=VALUES(state_json)
-                        """,
-                        (payload,),
-                    )
+            if self._record_exists:
+                filters = urllib.parse.urlencode({"id": f"eq.{self.RECORD_ID}"})
+                self._request("PATCH", f"{self.base_url}?{filters}", payload)
+            else:
+                self._request("POST", self.base_url, payload)
+                self._record_exists = True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                try:
+                    filters = urllib.parse.urlencode({"id": f"eq.{self.RECORD_ID}"})
+                    self._request("PATCH", f"{self.base_url}?{filters}", payload)
+                    self._record_exists = True
+                    return
+                except Exception as retry_exc:
+                    self.logger.error("Could not persist CloudBase state: %s", retry_exc)
+                    return
+            self.logger.error("Could not persist CloudBase state: HTTP %s", exc.code)
         except Exception as exc:
-            self.logger.error("Could not persist cloud state: %s", exc)
+            self.logger.error("Could not persist CloudBase state: %s", exc)
 
     def load(self):
         if not self.enabled:
             return None
         try:
-            with self._connect() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT state_json FROM smart_kitchen_state WHERE state_id=1")
-                    row = cursor.fetchone()
-            if row and row[0]:
-                value = json.loads(row[0])
+            params = urllib.parse.urlencode({"select": "state_json", "id": f"eq.{self.RECORD_ID}", "limit": "1"})
+            _, rows = self._request("GET", f"{self.base_url}?{params}")
+            if isinstance(rows, list) and rows:
+                self._record_exists = True
+                value = json.loads(rows[0].get("state_json", "{}"))
                 return value if isinstance(value, dict) else None
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                self.logger.error("Could not load CloudBase state: HTTP %s", exc.code)
         except Exception as exc:
-            self.logger.error("Could not load cloud state: %s", exc)
+            self.logger.error("Could not load CloudBase state: %s", exc)
         return None
