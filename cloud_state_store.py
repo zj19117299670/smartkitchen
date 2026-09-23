@@ -21,7 +21,10 @@ class CloudStateStore:
     def __init__(self, logger):
         self.logger = logger
         self.env_id = os.environ.get("CLOUDBASE_ENV_ID", "").strip()
-        self.api_key = os.environ.get("CLOUDBASE_API_KEY", "").strip()
+        self.api_key = (
+            os.environ.get("CLOUDBASE_APIKEY", "").strip()
+            or os.environ.get("CLOUDBASE_API_KEY", "").strip()
+        )
         self.enabled = bool(self.env_id and self.api_key)
         self._record_exists = False
         self.base_url = (
